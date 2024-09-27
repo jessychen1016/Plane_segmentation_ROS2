@@ -1,0 +1,147 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, Image, PointField
+from sensor_msgs_py.point_cloud2 import read_points, create_cloud
+import numpy as np
+import ros2_numpy
+import cv2
+from cv_bridge import CvBridge
+
+class LidarColorizerNode(Node):
+    def __init__(self):
+        super().__init__('lidar_colorizer_node')
+        self.pointcloud_sub = self.create_subscription(
+            PointCloud2, '/lidar_points', self.pointcloud_callback, 10)
+        self.image_sub = self.create_subscription(
+            Image, '/camera/image', self.image_callback, 10)
+        self.pointcloud_pub = self.create_publisher(
+            PointCloud2, '/lidar/colorized_points', 10)
+        
+        self.bridge = CvBridge()
+        self.camera_image = None
+
+        # Camera intrinsics (provided intrinsics)
+        self.K = np.array([[995.678, 0, 973.222], 
+                           [0, 997.51, 520.94], 
+                           [0, 0, 1]])
+
+        # Distortion coefficients (provided distortion coefficients)
+        self.dist_coeffs = np.array([0.139704, -0.109251, -0.001611, 0.001925, 0.0])
+
+        # Transformation from LiDAR to Camera (provided transformation)
+        self.T_camera_lidar = self.create_transformation_matrix(
+            translation=[-0.00932710524648428, 0.0382089838385582, 0.04157942906022072],
+            quaternion=[-0.4996961702250183, 0.4780072467203131, -0.5115363222485648, 0.5100425241302762]
+        )
+        self.T_lidar_camera = np.linalg.inv(self.T_camera_lidar)
+
+    def image_callback(self, msg):
+        
+        self.camera_image = cv2.bitwise_not(self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8'))
+        # self.camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def pointcloud_callback(self, msg):
+        if self.camera_image is None:
+            return
+        
+        # Extract the point cloud data
+        pc = ros2_numpy.numpify(msg)
+        points = np.array(pc['xyz'], dtype=np.float64)
+        # np.array(self.points, dtype=np.float64)
+        # points = np.array([p[:3] for p in read_points(msg, field_names=("x", "y", "z"), skip_nans=True)])
+
+        # Convert to homogeneous coordinates
+        num_points = points.shape[0]
+        homogeneous_points = np.hstack((points, np.ones((num_points, 1))))
+
+        # Apply the transformation (from LiDAR to camera)
+        points_camera = self.T_lidar_camera @ homogeneous_points.T
+
+        # Project points onto the image plane
+        uvs = self.K @ points_camera[:3, :]
+        uvs /= points_camera[2, :]  # Normalize by Z (depth)
+
+        # Distort the image points using the distortion coefficients
+        uvs_undistorted = self.undistort_points(uvs[:2, :])
+
+        # Filter points within camera bounds and in front of the camera
+        valid_mask = (uvs_undistorted[0, :] >= 0) & (uvs_undistorted[0, :] < self.camera_image.shape[1]) & \
+                     (uvs_undistorted[1, :] >= 0) & (uvs_undistorted[1, :] < self.camera_image.shape[0]) & \
+                     (points_camera[2, :] > 0)
+        valid_uvs = uvs_undistorted[:, valid_mask]
+        valid_points = points_camera[:, valid_mask]
+        
+
+        # Assign colors to the valid points
+        colors = self.camera_image[valid_uvs[1, :].astype(int), valid_uvs[0, :].astype(int)]
+        
+        
+        colorized_points = np.hstack((valid_points[:3, :].T, colors))
+        points_ready = self.transform_back(colorized_points)
+        # Publish the colorized point cloud
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='r', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='g', offset=16, datatype=PointField.FLOAT32, count=1),
+            PointField(name='b', offset=20, datatype=PointField.FLOAT32, count=1),
+        ]
+        header = msg.header
+        pc_data = create_cloud(header, fields, points_ready)
+        self.pointcloud_pub.publish(pc_data)
+
+    def create_transformation_matrix(self, translation, quaternion):
+        """ Create a 4x4 transformation matrix from translation and quaternion """
+        # Create rotation matrix from quaternion
+        rotation = self.quaternion_to_rotation_matrix(quaternion)
+
+        # Create 4x4 transformation matrix
+        T = np.eye(4)
+        T[:3, :3] = rotation
+        T[:3, 3] = translation
+        return T
+
+    def quaternion_to_rotation_matrix(self, q):
+        """ Convert quaternion [qx, qy, qz, qw] to a 3x3 rotation matrix """
+        qx, qy, qz, qw = q
+        return np.array([
+            [1 - 2*qy*qy - 2*qz*qz, 2*qx*qy - 2*qz*qw, 2*qx*qz + 2*qy*qw],
+            [2*qx*qy + 2*qz*qw, 1 - 2*qx*qx - 2*qz*qz, 2*qy*qz - 2*qx*qw],
+            [2*qx*qz - 2*qy*qw, 2*qy*qz + 2*qx*qw, 1 - 2*qx*qx - 2*qy*qy]
+        ])
+
+    def undistort_points(self, uvs):
+        """ Undistort 2D points using the distortion coefficients and camera intrinsics """
+        uvs = uvs.T.reshape(-1, 1, 2)  # Reshape to (N, 1, 2) format required by OpenCV
+        uvs_undistorted = cv2.undistortPoints(uvs, self.K, self.dist_coeffs, None, self.K)
+        return uvs_undistorted.squeeze().T  # Return in shape (2, N)
+    
+    def transform_back(self, point_cloud):
+        positions = point_cloud[:, :3]  # Nx3 for (x, y, z)
+        colors = point_cloud[:, 3:]      # Nx3 for (r, g, b)
+
+        # Homogenize the positions (add a column of ones)
+        ones = np.ones((positions.shape[0], 1))
+        homogeneous_positions = np.hstack((positions, ones))  # Nx4
+
+        # Apply the transformation
+        transformed_positions = homogeneous_positions @ self.T_camera_lidar.T  # Nx4
+
+        # # Extract the transformed x, y, z
+        # transformed_x = transformed_positions[:, 0]
+        # transformed_y = transformed_positions[:, 1]
+        # transformed_z = transformed_positions[:, 2]
+
+        # Combine transformed positions with the original colors
+        transformed_point_cloud = np.hstack((transformed_positions[:, :3], colors))
+        return transformed_point_cloud
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LidarColorizerNode()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

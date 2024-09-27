@@ -6,11 +6,13 @@ import random
 import ros2_numpy
 import threading
 import time
+import copy
 from shape_msgs.msg import Mesh, MeshTriangle
 from std_msgs.msg import Header
 from geometry_msgs.msg import Point
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
+from utils.utils import scanclustering
 
 
 class PointCloudSubscriber(Node):
@@ -29,11 +31,6 @@ class PointCloudSubscriber(Node):
         # Read the point cloud data
         # self.point_cloud_data = pc2.read_points(msg, field_names=['x', 'y', 'z', "intensity"], skip_nans=True)
         pc = ros2_numpy.numpify(msg)
-        print(pc['xyz'].shape)
-        # self.points=np.zeros((pc.shape[0],3))
-        # self.points[:,0]=pc['x']
-        # self.points[:,1]=pc['y']
-        # self.points[:,2]=pc['z']
         self.points=pc['xyz']
         self.process_point_cloud()
 
@@ -50,17 +47,18 @@ class PointCloudSubscriber(Node):
         # Create an Open3D point cloud object
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(point_cloud_np)
+        colored_pcd = scanclustering(copy.deepcopy(pcd).voxel_down_sample(voxel_size=0.05))
         downpcd = pcd.voxel_down_sample(voxel_size=0.05)
-        print(downpcd)
+        # print(downpcd)
         downpcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
         # using all defaults
         oboxes = downpcd.detect_planar_patches(
-            normal_variance_threshold_deg=60,
+            normal_variance_threshold_deg=20,
             coplanarity_deg=75,
-            outlier_ratio=0.25,
+            outlier_ratio=0.75,
             min_plane_edge_length=0,
             min_num_points=0,
-            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6))
 
         print("Detected {} patches".format(len(oboxes)))
 
@@ -85,6 +83,7 @@ class PointCloudSubscriber(Node):
         #                                 lookat=[2.4947, 1.7728, 1.5541],
         #                                 up=[-0.1726, -0.9630, 0.2071])
         meshpoint_publisher.pointcloud_publish(combined_points)
+        colorpoint_publisher.pointcloud_publish(colored_pcd)
 
 
 class MeshToPointCloudPublisher(Node):
@@ -95,7 +94,6 @@ class MeshToPointCloudPublisher(Node):
 
 
     def pointcloud_publish(self, points):
-
         
         # Convert combined points to PointCloud2 message
         header = Header()
@@ -108,21 +106,66 @@ class MeshToPointCloudPublisher(Node):
         self.publisher.publish(pc_data)
         self.get_logger().info('Published Combined PointCloud2 Message')
 
+class ColorPointCloudPublisher(Node):
+    def __init__(self):
+        super().__init__('color_pointcloud_publisher')
+        self.publisher = self.create_publisher(PointCloud2, '/colored_pointcloud', 1)
+        self.timer = self.create_timer(0.1, self.pointcloud_publish)  # Publish every 0.1 second
+
+
+    def pointcloud_publish(self, pcd):
+
+        points = np.asarray(pcd.points)
+        # print(points)
+        colors = np.asarray(pcd.colors)
+        # print(colors)
+        combined = np.hstack((points, colors*255))
+        print(combined.shape)
+
+        assert points.shape[0] == colors.shape[0]
+
+        # Concatenate points and colors
+        # combined = np.hstack((points, colors*255))
+        # print(combined)
+        # Convert combined points to PointCloud2 message
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = 'hesai_at128'  # Update to the appropriate frame_id
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='r', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='g', offset=16, datatype=PointField.FLOAT32, count=1),
+            PointField(name='b', offset=20, datatype=PointField.FLOAT32, count=1),
+        ]
+        
+        # Create PointCloud2 message
+        pc_data = pc2.create_cloud(header, fields, combined)
+        
+        # Publish the PointCloud2 message
+        self.publisher.publish(pc_data)
+        self.get_logger().info('Published Combined PointCloud2 Message')
+
 
 
 def main(args=None):
     rclpy.init(args=args)
     pointcloud_subscriber = PointCloudSubscriber()
     global meshpoint_publisher
+    global colorpoint_publisher
     meshpoint_publisher = MeshToPointCloudPublisher()
+    colorpoint_publisher = ColorPointCloudPublisher()
     try:
         rclpy.spin(pointcloud_subscriber)
         rclpy.spin(meshpoint_publisher)
+        rclpy.spin(colorpoint_publisher)
     except KeyboardInterrupt:
         print("Keyboard Interrupt")
     finally:
         pointcloud_subscriber.destroy_node()
         meshpoint_publisher.destroy_node()
+        colorpoint_publisher.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
