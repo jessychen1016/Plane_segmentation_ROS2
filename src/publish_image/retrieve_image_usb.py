@@ -4,13 +4,27 @@ from sensor_msgs.msg import Image, CameraInfo
 import cv2
 from cv_bridge import CvBridge
 from threading import Thread, Lock
+import zmq
+import base64
+import numpy as np
 
 class MultiTopicPublisher(Node):
     def __init__(self):
         super().__init__('multi_topic_publisher')
 
+
+        self.zmq_context = zmq.Context()
+        self.socket = self.zmq_context.socket(zmq.PUB)
+        self.socket.bind("tcp://*:5555")  # Binding to port 5555 for sending images
+
+        self.receive_context = zmq.Context()
+        self.receive_socket = self.receive_context.socket(zmq.SUB)
+        self.receive_socket.connect("tcp://localhost:5556")  # Binding to port 5555 for sending images
+        self.receive_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages\
+
         # Create publishers for multiple topics
         self.image_publisher = self.create_publisher(Image, 'camera/image', 10)
+        self.semantic_publisher = self.create_publisher(Image, 'camera/semantic_image', 10)
         self.camera_info_publisher = self.create_publisher(CameraInfo, 'camera/camera_info', 10)
 
         # Initialize OpenCV VideoCapture for the USB camera
@@ -18,7 +32,7 @@ class MultiTopicPublisher(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         self.cap.set(cv2.CAP_PROP_FPS, 10)
-        # self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 1)
 
     
         self.lock = Lock()
@@ -38,6 +52,7 @@ class MultiTopicPublisher(Node):
     def capture_frames(self):
         while rclpy.ok():
             ret, frame = self.cap.read()
+            # equilize the frame, it is tooo bright
             if ret:
                 with self.lock:
                     self.frame = frame
@@ -45,13 +60,37 @@ class MultiTopicPublisher(Node):
     def publish_image(self):
         with self.lock:
             if self.frame is not None:
+                
+
+                '''send the image through zmq to other scritps that does not support ROS2'''
+                _, buffer = cv2.imencode('.jpg', self.frame)
+                img_as_text = base64.b64encode(buffer).decode('utf-8')
+                self.socket.send_string(f"{img_as_text}")
+
+                
+                '''recieve segmentated images'''
+                img_as_text_receive = self.receive_socket.recv_string()
+                # Decode the base64 string back to binary
+                img_data_receive = base64.b64decode(img_as_text_receive)
+                # Convert the binary data to a NumPy array and decode the JPEG
+                np_img_receive = np.frombuffer(img_data_receive, dtype=np.uint8)
+                img_segment = cv2.imdecode(np_img_receive, cv2.IMREAD_COLOR)
+
+                '''send original image'''
                 # Convert the OpenCV image (BGR) to a ROS Image message
                 image_message = self.br.cv2_to_imgmsg(self.frame, encoding="bgr8")
                 image_message.header.stamp = self.get_clock().now().to_msg()
                 image_message.header.frame_id = "camera_frame"
-
                 # Publish the image
                 self.image_publisher.publish(image_message)
+
+                '''send segmented image'''
+                image_message_segment = self.br.cv2_to_imgmsg(img_segment, encoding="bgr8")
+                image_message_segment.header.stamp = self.get_clock().now().to_msg()
+                image_message_segment.header.frame_id = "camera_frame"
+                # Publish the image
+                self.semantic_publisher.publish(image_message_segment)
+
 
     def publish_camera_info(self):
         # Create a fake CameraInfo message
@@ -60,11 +99,15 @@ class MultiTopicPublisher(Node):
         camera_info_msg.header.frame_id = "camera_frame"
         camera_info_msg.width = 1920
         camera_info_msg.height = 1080
-        camera_info_msg.k = [995.678, 0.0, 973.222, 0.0, 997.51, 520.94, 0.0, 0.0, 1.0]
-        camera_info_msg.d = [0.139704, -0.109251, -0.001611, 0.001925, 0.0]
+        camera_info_msg.k = [1043.02215,    0.     ,  963.4692 ,
+                             0.     , 1043.30157,  528.77189,
+                             0.     ,    0.     ,    1.     ]
+        camera_info_msg.d = [0.153638, -0.143077, 0.003250, -0.001801, 0.000000]
         camera_info_msg.distortion_model = "plumb_bob"
         camera_info_msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        camera_info_msg.p = [1033.7482, 0.0, 970.2617, 0.0, 0.0, 1042.58, 518.215, 0.0, 0.0, 0.0, 1.0, 0.0]
+        camera_info_msg.p = [1075.50488,    0.     ,  958.35386,    0.  ,
+                             0.     , 1085.85059,  531.53889,    0.     ,
+                             0.     ,    0.     ,    1.     ,    0.     ]
 
         # Publish the CameraInfo message
         self.camera_info_publisher.publish(camera_info_msg)

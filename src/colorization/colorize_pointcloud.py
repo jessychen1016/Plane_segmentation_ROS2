@@ -14,34 +14,49 @@ class LidarColorizerNode(Node):
             PointCloud2, '/lidar_points', self.pointcloud_callback, 10)
         self.image_sub = self.create_subscription(
             Image, '/camera/image', self.image_callback, 10)
+        self.semantic_image_sub = self.create_subscription(
+            Image, '/camera/semantic_image', self.semantic_image_callback, 10)
         self.pointcloud_pub = self.create_publisher(
             PointCloud2, '/lidar/colorized_points', 10)
+        self.semantic_pointcloud_pub = self.create_publisher(
+            PointCloud2, '/lidar/semantic_points', 10)
         
         self.bridge = CvBridge()
         self.camera_image = None
+        self.camera_image_rgb = None
 
         # Camera intrinsics (provided intrinsics)
-        self.K = np.array([[995.678, 0, 973.222], 
-                           [0, 997.51, 520.94], 
+        self.K = np.array([[1043.02215,    0.     ,  963.4692], 
+                           [0, 1043.30157,  528.77189], 
                            [0, 0, 1]])
 
         # Distortion coefficients (provided distortion coefficients)
-        self.dist_coeffs = np.array([0.139704, -0.109251, -0.001611, 0.001925, 0.0])
+        self.dist_coeffs = np.array([0.153638, -0.143077, 0.003250, -0.001801, 0.000000])
 
         # Transformation from LiDAR to Camera (provided transformation)
         self.T_camera_lidar = self.create_transformation_matrix(
-            translation=[-0.00932710524648428, 0.0382089838385582, 0.04157942906022072],
-            quaternion=[-0.4996961702250183, 0.4780072467203131, -0.5115363222485648, 0.5100425241302762]
+            translation=[-0.30219897627830505, 0.06125678867101669, 0.04833770543336868],
+            quaternion=[-0.5033807312037768, 0.47727347938784354, -0.5103808193751581, 0.5082610304402359]
         )
         self.T_lidar_camera = np.linalg.inv(self.T_camera_lidar)
 
     def image_callback(self, msg):
         
-        self.camera_image = cv2.bitwise_not(self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8'))
-        # self.camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # self.camera_image = cv2.bitwise_not(self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8'))
+        self.camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # convert to rgb8
+        self.camera_image_rgb = cv2.cvtColor(self.camera_image, cv2.COLOR_BGR2RGB)
+
+    def semantic_image_callback(self, msg):
+        
+        # self.camera_image = cv2.bitwise_not(self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8'))
+        self.semantic_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # convert to rgb8
+        self.semantic_image_rgb = cv2.cvtColor(self.semantic_image, cv2.COLOR_BGR2RGB)
+
 
     def pointcloud_callback(self, msg):
-        if self.camera_image is None:
+        if self.camera_image_rgb is None:
             return
         
         # Extract the point cloud data
@@ -70,14 +85,19 @@ class LidarColorizerNode(Node):
                      (points_camera[2, :] > 0)
         valid_uvs = uvs_undistorted[:, valid_mask]
         valid_points = points_camera[:, valid_mask]
-        
-
         # Assign colors to the valid points
-        colors = self.camera_image[valid_uvs[1, :].astype(int), valid_uvs[0, :].astype(int)]
+        colors = 255 - self.camera_image_rgb[valid_uvs[1, :].astype(int), valid_uvs[0, :].astype(int)]
+        semantic_colors = 255 - self.semantic_image_rgb[valid_uvs[1, :].astype(int), valid_uvs[0, :].astype(int)]
+        # print(colors.dtype)
+        # for i in range(colors.shape[0]):
+        #     if colors[i,0] == 0 and colors[i,1] == 0 and colors[i,2] == 0:
+        #         colors[i,:] = [254,254,254]
         
         
         colorized_points = np.hstack((valid_points[:3, :].T, colors))
+        semantic_points = np.hstack((valid_points[:3, :].T, semantic_colors))
         points_ready = self.transform_back(colorized_points)
+        semantic_points_ready = self.transform_back(semantic_points)
         # Publish the colorized point cloud
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
@@ -89,7 +109,10 @@ class LidarColorizerNode(Node):
         ]
         header = msg.header
         pc_data = create_cloud(header, fields, points_ready)
+        semantic_pc_data = create_cloud(header, fields, semantic_points_ready)
+        
         self.pointcloud_pub.publish(pc_data)
+        self.semantic_pointcloud_pub.publish(semantic_pc_data)
 
     def create_transformation_matrix(self, translation, quaternion):
         """ Create a 4x4 transformation matrix from translation and quaternion """

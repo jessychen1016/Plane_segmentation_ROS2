@@ -11,3 +11,5 @@ srv_gen/
 build_isolated/
 devel_isolated/
 *.pyc
+*.pt
+
