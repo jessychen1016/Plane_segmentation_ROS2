@@ -25,7 +25,6 @@ while True:
     if  init == True:
         cv2.waitKey(10)
         init = False
-
     # Decode the base64 string back to binary
     img_data = base64.b64decode(img_as_text)
 
